@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useReliableWebSocket } from "@/hooks/useWebSocket";
 
@@ -239,7 +239,10 @@ export default function PokerTable() {
   }, [gameState?.lobby_timer, isInLobby]);
 
   // Single WebSocket connection - no player name in URL
-  const wsUrl = gameId ? `ws://localhost:8000/ws/${gameId}` : "";
+  // Use useMemo to stabilize the URL
+  const wsUrl = useMemo(() => {
+    return gameId ? `ws://localhost:8000/ws/${gameId}` : "";
+  }, [gameId]);
   
   const { isConnected, sendMessage } = useReliableWebSocket<GameState>(wsUrl, (msg) => {
     if (msg.type === "state_update") {
@@ -451,7 +454,7 @@ export default function PokerTable() {
           raise_amount: raiseAmount,
         }),
       });
-      // testing new branch version
+
       const data = await res.json();
 
       if (data.messages?.length) {
@@ -703,10 +706,6 @@ export default function PokerTable() {
                 </div>
               </div>
             )}
-
-
-
-            
 
             {isInLobby && (
               <div className="bg-blue-600 p-4 rounded-lg text-center">

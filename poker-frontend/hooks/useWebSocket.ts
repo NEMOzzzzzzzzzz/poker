@@ -26,6 +26,7 @@ export function useReliableWebSocket<T>(
   const heartbeatTimer = useRef<NodeJS.Timeout | null>(null);
   const backoffAttempt = useRef(0);
   const isConnecting = useRef(false);
+  const hasConnectedOnce = useRef(false); // Track if we've connected before
 
   const [isConnected, setIsConnected] = useState(false);
 
@@ -66,7 +67,16 @@ export function useReliableWebSocket<T>(
       return;
     }
 
-    if (wsRef.current || isConnecting.current) return;
+    // Prevent duplicate connections
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      console.log("[WS] Already connected, skipping");
+      return;
+    }
+    
+    if (isConnecting.current) {
+      console.log("[WS] Connection already in progress");
+      return;
+    }
 
     isConnecting.current = true;
 
@@ -116,11 +126,25 @@ export function useReliableWebSocket<T>(
   }, [url, onMessage, heartbeatInterval, scheduleReconnect]);
 
   useEffect(() => {
-    connect();
+    if (!url || !url.startsWith("ws")) {
+      return;
+    }
+
+    // Only connect if we haven't already or if the connection is closed
+    const shouldConnect = !hasConnectedOnce.current || 
+                         !wsRef.current || 
+                         wsRef.current.readyState === WebSocket.CLOSED;
+    
+    if (shouldConnect) {
+      hasConnectedOnce.current = true;
+      connect();
+    }
 
     return () => {
+      console.log("[WS] Cleanup called - keeping connection alive");
+      // Don't close on unmount in dev (Strict Mode)
+      // Only clear timers
       clearAllTimers();
-      closeCurrentSocket();
     };
   }, [url, connect]);
 
@@ -132,7 +156,6 @@ export function useReliableWebSocket<T>(
     }
     return false;
   }, []);
-
 
   return { isConnected, sendMessage };
 }
