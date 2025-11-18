@@ -1,7 +1,5 @@
 # main.py
-#from poker_engine.heuristic_ai import HeuristicAI
-#from poker_engine.simple_ai import SimpleAI
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from uuid import uuid4
@@ -12,14 +10,11 @@ from fastapi import Body
 import random
 from poker_engine.poker_engine_api import PokerGame
 from ws_manager import ConnectionManager
-from fastapi import WebSocket, WebSocketDisconnect
-import time
 
 manager = ConnectionManager()
 
 app = FastAPI(title="Poker Game API")
 
-# Allow requests from your React/Next.js frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -28,15 +23,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store for active games (room_id -> PokerGame)
 games = {}
 locks = {}
-lobby_timers = {}  # Track lobby timers for each game
+lobby_timers = {}
 executor = ProcessPoolExecutor(max_workers=2)
 
-# Lobby configuration
-LOBBY_DURATION = 15  # 15 seconds lobby phase
-MIN_PLAYERS = 2      # Minimum players to start game
+LOBBY_DURATION = 15
+MIN_PLAYERS = 2
 
 # --- Request models ---
 class CreateGameRequest(BaseModel):
@@ -55,6 +48,10 @@ class JoinSeatRequest(BaseModel):
 class LeaveSeatRequest(BaseModel):
     seat_index: int
 
+class UpgradeToPlayerMessage(BaseModel):
+    player_name: str
+    seat_index: int
+
 # --- Lobby Management ---
 async def start_lobby_timer(game_id: str):
     """Start or restart the lobby timer for a game"""
@@ -71,24 +68,19 @@ async def lobby_countdown(game_id: str):
 
     try:
         for remaining in range(LOBBY_DURATION, -1, -1):
-            # Update lobby timer in game state
             game.lobby_timer = remaining
             game.game_starting = remaining <= 5 and remaining > 0
             
-            # Broadcast timer update
             await manager.broadcast(game_id, game)
-
             
             if remaining == 0:
                 break
                 
             await asyncio.sleep(1)
         
-        # Timer ended - check if we can start the game
         await check_and_start_game(game_id)
         
     except asyncio.CancelledError:
-        # Timer was cancelled (player joined/left)
         pass
     except Exception as e:
         print(f"Lobby timer error for game {game_id}: {e}")
@@ -100,28 +92,20 @@ async def check_and_start_game(game_id: str):
         return
 
     async with locks[game_id]:
-        # Count active players (non-empty seats)
         active_players = sum(1 for p in game.players if getattr(p, "name", "") and getattr(p, "name", "") != "")
         
         if active_players >= MIN_PLAYERS:
-            # Start the game!
             print(f"Starting game {game_id} with {active_players} players")
-            game.stage = "preflop"  # Or whatever your initial stage is
+            game.stage = "preflop"
             game.lobby_timer = None
             game.game_starting = False
             
-            # Start the first hand
             game.play_hand()
-            
             await manager.broadcast(game_id, game)
-
         else:
-            # Not enough players - reset timer
             print(f"Not enough players for game {game_id} ({active_players}/{MIN_PLAYERS})")
             game.lobby_timer = LOBBY_DURATION
             await manager.broadcast(game_id, game)
-
-            # Restart timer
             await start_lobby_timer(game_id)
 
 def get_active_player_count(game: PokerGame) -> int:
@@ -132,25 +116,18 @@ def get_active_player_count(game: PokerGame) -> int:
 @app.post("/create_game")
 async def create_game(req: CreateGameRequest):
     """Create a new poker game session with optional seat_count."""
-
     game_id = str(uuid4())[:8]
     seat_count = req.seat_count or 6
 
-    # Prepare initial list of names: put provided names into seats 0..n-1, leave others as '' (empty)
     initial_names = req.player_names.copy()
-
-    # Fill remaining seats with empty placeholder names (empty string)
     while len(initial_names) < seat_count:
-        initial_names.append("")  # "" indicates empty seat
+        initial_names.append("")
 
     game = PokerGame(initial_names)
-
-    # Initialize lobby state
     game.stage = "lobby"
     game.lobby_timer = LOBBY_DURATION
     game.game_starting = False
 
-    # mark any "Bot" names as bot
     for i, p in enumerate(game.players):
         if p.name == "Bot":
             p.is_bot = True
@@ -159,7 +136,6 @@ async def create_game(req: CreateGameRequest):
     games[game_id] = game
     locks[game_id] = asyncio.Lock()
 
-    # Start lobby timer
     await start_lobby_timer(game_id)
 
     return {"game_id": game_id, "state": game.get_game_state()}
@@ -185,7 +161,6 @@ async def add_ai_player(game_id: str, payload: dict = Body(...)):
         if existing.name and existing.name != "":
             raise HTTPException(status_code=409, detail="Seat already taken")
 
-        # Set player as AI
         existing.name = ai_name
         existing.is_bot = True
         existing.folded = False
@@ -194,15 +169,10 @@ async def add_ai_player(game_id: str, payload: dict = Body(...)):
             existing.chips = 1000
         existing.hand = []
 
-        # Restart lobby timer
         await start_lobby_timer(game_id)
-
         await manager.broadcast(game_id, game)
 
-
     return {"success": True, "state": game.get_game_state()}
-
-
 
 @app.post("/start_hand/{game_id}")
 async def start_hand(game_id: str):
@@ -212,13 +182,11 @@ async def start_hand(game_id: str):
         raise HTTPException(status_code=404, detail="Game not found")
 
     async with locks[game_id]:
-        # If we're in lobby, check if we can start
         if getattr(game, 'stage', '') == 'lobby':
             active_players = get_active_player_count(game)
             if active_players < MIN_PLAYERS:
                 raise HTTPException(status_code=400, detail=f"Need at least {MIN_PLAYERS} players to start")
             
-            # Cancel lobby timer and start game
             if game_id in lobby_timers:
                 lobby_timers[game_id].cancel()
                 del lobby_timers[game_id]
@@ -235,7 +203,8 @@ async def start_hand(game_id: str):
 @app.post("/join_seat/{game_id}")
 async def join_seat(game_id: str, payload: JoinSeatRequest):
     """
-    Join a seat in the game during lobby phase
+    Join a seat in the game during lobby phase.
+    NOTE: This is called via HTTP, not WebSocket message
     """
     game = games.get(game_id)
     if not game:
@@ -245,7 +214,6 @@ async def join_seat(game_id: str, payload: JoinSeatRequest):
     seat_index = payload.seat_index
 
     async with locks[game_id]:
-        # Check if we're in lobby phase
         if getattr(game, 'stage', '') != 'lobby':
             raise HTTPException(status_code=400, detail="Can only join seats during lobby phase")
 
@@ -253,36 +221,25 @@ async def join_seat(game_id: str, payload: JoinSeatRequest):
             raise HTTPException(status_code=400, detail="Invalid seat index")
 
         existing = game.players[seat_index]
-        # If seat occupied and not empty string -> reject
         if getattr(existing, "name", "") and getattr(existing, "name", "") != "":
             raise HTTPException(status_code=409, detail="Seat already taken")
 
-        # Set player properties
         existing.name = player_name
         existing.is_bot = False
         existing.folded = False
         existing.current_bet = 0
-        # give default buy-in if chips are 0
         if getattr(existing, "chips", 0) <= 0:
             existing.chips = 1000
-
-        # Reset hand
         existing.hand = []
 
-        # Restart lobby timer when someone joins
         await start_lobby_timer(game_id)
-
-        # Broadcast updated state
         await manager.broadcast(game_id, game)
-
 
     return {"success": True, "state": game.get_game_state()}
 
 @app.post("/leave_seat/{game_id}")
 async def leave_seat(game_id: str, payload: LeaveSeatRequest):
-    """
-    Leave a seat during lobby phase
-    """
+    """Leave a seat during lobby phase"""
     game = games.get(game_id)
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
@@ -290,7 +247,6 @@ async def leave_seat(game_id: str, payload: LeaveSeatRequest):
     seat_index = payload.seat_index
 
     async with locks[game_id]:
-        # Check if we're in lobby phase
         if getattr(game, 'stage', '') != 'lobby':
             raise HTTPException(status_code=400, detail="Can only leave seats during lobby phase")
 
@@ -303,23 +259,16 @@ async def leave_seat(game_id: str, payload: LeaveSeatRequest):
         if not player_name or player_name == "":
             raise HTTPException(status_code=400, detail="Seat is already empty")
 
-        # Clear the seat
         player.name = ""
         player.is_bot = False
         player.folded = False
         player.current_bet = 0
         player.hand = []
-        # Keep chips so player can rejoin with same stack?
 
-        # Restart lobby timer when someone leaves
         await start_lobby_timer(game_id)
-
-        # Broadcast updated state
         await manager.broadcast(game_id, game)
 
-
     return {"success": True, "state": game.get_game_state()}
-
 
 @app.post("/action/{game_id}")
 async def player_action(game_id: str, data: dict = Body(...)):
@@ -328,7 +277,6 @@ async def player_action(game_id: str, data: dict = Body(...)):
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    # Don't allow actions during lobby phase
     if getattr(game, 'stage', '') == 'lobby':
         raise HTTPException(status_code=400, detail="Game is in lobby phase - cannot perform actions")
 
@@ -337,24 +285,19 @@ async def player_action(game_id: str, data: dict = Body(...)):
         action = data["action"]
         raise_amount = data.get("raise_amount", 0)
 
-        # Log the incoming action
         print(f"[ACTION] Player {player_index} ({game.players[player_index].name}) action: {action} {raise_amount}")
 
-        # Apply human action
         result = game.execute_action(player_index, action, raise_amount)
         print(f"[ACTION RESULT] {result}")
         
         state = game.get_game_state()
-
         await manager.broadcast(game_id, game)
 
-
-        # Log messages from human player
         messages = [f"{game.players[player_index].name} chose {action} {raise_amount if raise_amount else ''}".strip()]
 
         # AI turn loop
         ai_iterations = 0
-        max_ai_iterations = 20  # Safety limit
+        max_ai_iterations = 20
         
         while (
             not game.game_over
@@ -368,13 +311,12 @@ async def player_action(game_id: str, data: dict = Body(...)):
 
             print(f"[AI TURN] {ai_name} (iteration {ai_iterations})")
 
-            think_time = random.uniform(1, 2)  # Reduced for testing
+            think_time = random.uniform(1, 2)
             await asyncio.sleep(think_time)
 
             ai_state = game.get_game_state()
             loop = asyncio.get_event_loop()
 
-            # Create AI instance (MonteCarlo, Heuristic, etc.)
             ai_player = MonteCarloAI(name=ai_name, simulations=200)
             
             try:
@@ -382,13 +324,11 @@ async def player_action(game_id: str, data: dict = Body(...)):
                 print(f"[AI DECISION] {ai_name}: {ai_decision}")
             except Exception as e:
                 print(f"[AI ERROR] {ai_name} failed to decide: {e}")
-                # Default to fold on error
                 ai_decision = {"move": "fold", "raise_amount": 0}
 
             move = ai_decision["move"]
             amt = ai_decision.get("raise_amount", 0)
 
-            # Execute and log AI move
             print(f"[AI ACTION] {ai_name} chooses {move} {amt if amt else ''} after {think_time:.1f}s")
             messages.append(f"{ai_name} waited {think_time:.1f}s → {move} {amt if amt else ''}")
 
@@ -396,15 +336,12 @@ async def player_action(game_id: str, data: dict = Body(...)):
             print(f"[AI ACTION RESULT] {result}")
             
             state = game.get_game_state()
-
             await manager.broadcast(game_id, game)
-
 
         if ai_iterations >= max_ai_iterations:
             print(f"[WARNING] AI loop hit max iterations limit!")
 
         return {"result": result, "state": state, "messages": messages}
-    
 
 @app.get("/state/{game_id}")
 async def get_state(game_id: str):
@@ -415,35 +352,82 @@ async def get_state(game_id: str):
 
     return {"state": game.get_game_state()}
 
-@app.websocket("/ws/{game_id}/{player_name}")
-async def websocket_endpoint(websocket: WebSocket, game_id: str, player_name: str):
-    await manager.connect(game_id, websocket)
-    # store name on socket
-    websocket.player_name = player_name
-    print(f"[WS CONNECT] game={game_id} player={player_name}")
+@app.websocket("/ws/{game_id}")
+async def websocket_endpoint(websocket: WebSocket, game_id: str):
+    """
+    Single WebSocket connection that handles both spectators and players.
+    Clients upgrade from spectator to player via WebSocket messages.
+    """
+    # Connect as spectator initially
+    conn_state = await manager.connect(game_id, websocket)
+    print(f"[WS CONNECT] game={game_id} conn_id={conn_state.connection_id} role=spectator")
 
-    # send initial personalized state (if available)
     game = games.get(game_id)
     if game:
         try:
+            # Send initial state as spectator (no private cards visible)
             await websocket.send_json({
                 "type": "state_update",
-                "state": game.get_game_state(viewer_name=player_name)
+                "state": game.get_game_state(viewer_name=None)
             })
-            print(f"[WS INIT STATE SENT] to={player_name}")
+            print(f"[WS INIT STATE SENT] to={conn_state.connection_id} as spectator")
         except Exception as e:
-            print(f"[WS INIT ERROR] to={player_name}: {e}")
+            print(f"[WS INIT ERROR] to={conn_state.connection_id}: {e}")
 
     try:
         while True:
-            # keep the socket open; ignore incoming messages for now
-            await websocket.receive_text()
+            # Listen for messages from client
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            
+            if msg_type == "upgrade_to_player":
+                # Client wants to become a player
+                player_name = data.get("player_name")
+                seat_index = data.get("seat_index")
+                
+                print(f"[WS] Connection {conn_state.connection_id} requesting upgrade to player: {player_name} seat {seat_index}")
+                
+                # Upgrade the connection
+                success = manager.upgrade_connection_to_player(websocket, player_name, seat_index)
+                
+                if success:
+                    # Send updated state with private cards visible
+                    if game:
+                        personalized_state = game.get_game_state(viewer_name=player_name)
+                        await websocket.send_json({
+                            "type": "upgrade_success",
+                            "state": personalized_state
+                        })
+                        print(f"[WS] Upgrade successful for {player_name}")
+                else:
+                    await websocket.send_json({
+                        "type": "upgrade_failed",
+                        "error": "Could not upgrade to player"
+                    })
+                    
+            elif msg_type == "downgrade_to_spectator":
+                # Player wants to become spectator again
+                print(f"[WS] Player {conn_state.player_name} requesting downgrade to spectator")
+                manager.downgrade_connection_to_spectator(websocket)
+                
+                # Send state without private cards
+                if game:
+                    await websocket.send_json({
+                        "type": "state_update",
+                        "state": game.get_game_state(viewer_name=None)
+                    })
+            
+            elif msg_type == "ping":
+                # Heartbeat
+                await websocket.send_json({"type": "pong"})
+            
+            else:
+                print(f"[WS] Unknown message type: {msg_type}")
+                
     except WebSocketDisconnect:
         manager.disconnect(game_id, websocket)
-        print(f"[WS DISCONNECT] game={game_id} player={player_name}")
+        print(f"[WS DISCONNECT] game={game_id} conn_id={conn_state.connection_id}")
 
-
-# Cleanup when game ends
 @app.delete("/game/{game_id}")
 async def cleanup_game(game_id: str):
     """Clean up a game session"""

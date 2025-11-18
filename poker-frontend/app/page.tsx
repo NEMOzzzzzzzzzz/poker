@@ -2,8 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useReliableWebSocket, WSMessage } from "@/hooks/useWebSocket";
-
+import { useReliableWebSocket } from "@/hooks/useWebSocket";
 
 // Types
 type Player = {
@@ -31,19 +30,17 @@ type GameState = {
   game_starting?: boolean;
 };
 
-// Seat positions for 6 players around an oval table
+// Seat positions for 6 players
 const SEAT_POSITIONS = [
-  { top: "70%", left: "50%", transform: "translate(-50%, -50%)" }, // Bottom (Player 0)
-  { top: "70%", left: "10%", transform: "translate(-50%, -50%)" }, // Bottom Left
-  { top: "30%", left: "10%", transform: "translate(-50%, -50%)" }, // Top Left
-  { top: "10%", left: "50%", transform: "translate(-50%, -50%)" }, // Top (Player 1 in 2p)
-  { top: "30%", left: "90%", transform: "translate(-50%, -50%)" }, // Top Right
-  { top: "70%", left: "90%", transform: "translate(-50%, -50%)" }, // Bottom Right
+  { top: "70%", left: "50%", transform: "translate(-50%, -50%)" },
+  { top: "70%", left: "10%", transform: "translate(-50%, -50%)" },
+  { top: "30%", left: "10%", transform: "translate(-50%, -50%)" },
+  { top: "10%", left: "50%", transform: "translate(-50%, -50%)" },
+  { top: "30%", left: "90%", transform: "translate(-50%, -50%)" },
+  { top: "70%", left: "90%", transform: "translate(-50%, -50%)" },
 ];
 
-const LOBBY_TIMER_DURATION = 15; // 15 seconds lobby phase
-
-// Types used by the parser
+const LOBBY_TIMER_DURATION = 15;
 
 function useAnimatedNumber(value: number, duration = 0.4) {
   const [display, setDisplay] = useState(value);
@@ -104,7 +101,7 @@ function PlayerSeat({
   currentPlayerName,
   onJoinSeat,
   onLeaveSeat,
-  onAddAI, // Add this prop
+  onAddAI,
 }: {
   player: Player | null;
   seatIndex: number;
@@ -114,7 +111,7 @@ function PlayerSeat({
   currentPlayerName: string;
   onJoinSeat: (seatIndex: number) => void;
   onLeaveSeat: (seatIndex: number) => void;
-  onAddAI: (seatIndex: number) => void; // Add this
+  onAddAI: (seatIndex: number) => void;
 }) {
   const position = SEAT_POSITIONS[seatIndex];
 
@@ -138,7 +135,6 @@ function PlayerSeat({
             `}
             style={{ width: "180px" }}
           >
-            {/* Dealer Button */}
             {isDealer && (
               <motion.div
                 initial={{ scale: 0 }}
@@ -149,7 +145,6 @@ function PlayerSeat({
               </motion.div>
             )}
 
-            {/* Player Name & Status */}
             <div className="mb-2">
               <p className="font-bold text-white text-sm truncate">
                 {player.name}
@@ -164,8 +159,7 @@ function PlayerSeat({
               )}
             </div>
 
-            {/* Leave Seat Button (only in lobby) */}
-            {isInLobby && (
+            {isInLobby && player.name === currentPlayerName && (
               <motion.button
                 whileHover={{ scale: 1.05 }}
                 whileTap={{ scale: 0.95 }}
@@ -176,7 +170,6 @@ function PlayerSeat({
               </motion.button>
             )}
 
-            {/* Cards */}
             <div className="flex gap-1 justify-center">
               {player.hand && player.hand.map((card, i) => (
                 <motion.div
@@ -236,79 +229,92 @@ export default function PokerTable() {
 
   const animatedPot = useAnimatedNumber(gameState?.pot || 0);
 
-  // Check if we're in lobby phase
   const isInLobby = gameState?.stage === "lobby" || !gameState?.stage;
   const activePlayers = gameState?.players.filter(p => p && p.name).length || 0;
 
-  // Lobby timer effect
   useEffect(() => {
     if (isInLobby && gameState?.lobby_timer !== undefined) {
       setLobbyTimer(gameState.lobby_timer);
     }
   }, [gameState?.lobby_timer, isInLobby]);
 
-  useReliableWebSocket<GameState>(
-    gameId
-      ? `ws://localhost:8000/ws/${gameId}/${currentPlayerName || "spectator"}`
-      : "",
-    (msg) => {
+  // Single WebSocket connection - no player name in URL
+  const wsUrl = gameId ? `ws://localhost:8000/ws/${gameId}` : "";
+  
+  const { isConnected, sendMessage } = useReliableWebSocket<GameState>(wsUrl, (msg) => {
+    if (msg.type === "state_update") {
       const state = msg.state;
-      setGameState(state);
-
-      if (typeof state.lobby_timer === "number") {
-        setLobbyTimer(state.lobby_timer);
+      if (state) {
+        setGameState(state);
+        if (typeof state.lobby_timer === "number") {
+          setLobbyTimer(state.lobby_timer);
+        }
       }
+    } else if (msg.type === "upgrade_success") {
+      console.log("[CLIENT] Successfully upgraded to player");
+      if (msg.state) {
+        setGameState(msg.state);
+      }
+    } else if (msg.type === "upgrade_failed") {
+      console.error("[CLIENT] Failed to upgrade:", msg.error);
+      setError(msg.error || "Failed to upgrade to player");
     }
-  );
-
+  });
 
   async function joinSeat(seatIndex: number) {
-  if (!gameId) {
-    setError("You must create or open a game first.");
-    return;
-  }
-
-  if (!isInLobby) {
-    setError("Cannot join seat while game is in progress. Wait for the next lobby phase.");
-    return;
-  }
-
-  const name = prompt("Enter your name to take this seat:", currentPlayerName || "Player");
-  if (!name || name.trim() === "") return;
-
-  const trimmedName = name.trim();
-
-  setLoading(true);
-  setError(null);
-
-  try {
-    const res = await fetch(`${apiBase}/join_seat/${gameId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ player_name: trimmedName, seat_index: seatIndex }),
-    });
-
-    if (res.ok) {
-      // Update our local identity
-      setCurrentPlayerName(trimmedName);
-      
-      setActionLog((prev) => [...prev, `${trimmedName} joined seat ${seatIndex + 1}`]);
-    } else {
-      const errData: unknown = await res.json().catch(() => ({ detail: "Unknown error" }));
-      if (typeof errData === "object" && errData !== null && "detail" in errData) {
-        setError((errData as { detail: string }).detail);
-      } else {
-        setError("Could not take seat");
-      }
+    if (!gameId) {
+      setError("You must create or open a game first.");
+      return;
     }
-  } catch (err) {
-    console.error("Error joining seat:", err);
-    setError("Failed to connect to server. Make sure backend is running.");
-  } finally {
-    setLoading(false);
-  }
-}
 
+    if (!isInLobby) {
+      setError("Cannot join seat while game is in progress. Wait for the next lobby phase.");
+      return;
+    }
+
+    const name = prompt("Enter your name to take this seat:", currentPlayerName || "Player");
+    if (!name || name.trim() === "") return;
+
+    const trimmedName = name.trim();
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      // First, update game state via HTTP
+      const res = await fetch(`${apiBase}/join_seat/${gameId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player_name: trimmedName, seat_index: seatIndex }),
+      });
+
+      if (res.ok) {
+        // Update local player name
+        setCurrentPlayerName(trimmedName);
+        
+        // Now upgrade the WebSocket connection
+        const success = sendMessage({
+          type: "upgrade_to_player",
+          player_name: trimmedName,
+          seat_index: seatIndex,
+        });
+
+        if (success) {
+          setActionLog((prev) => [...prev, `${trimmedName} joined seat ${seatIndex + 1}`]);
+        } else {
+          setError("WebSocket not connected. Reconnecting...");
+        }
+      } else {
+        const errData: { detail?: string } = await res.json().catch(() => ({ detail: "Unknown error" }));
+        setError(errData.detail || "Could not take seat");
+      }
+    } catch (err) {
+      console.error("Error joining seat:", err);
+      setError("Failed to connect to server. Make sure backend is running.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function leaveSeat(seatIndex: number) {
     if (!gameId || !gameState) return;
@@ -333,11 +339,16 @@ export default function PokerTable() {
 
       if (res.ok) {
         setActionLog((prev) => [...prev, `${player.name} left seat ${seatIndex + 1}`]);
+        
         if (player.name === currentPlayerName) {
+          // Downgrade connection back to spectator
+          sendMessage({
+            type: "downgrade_to_spectator"
+          });
           setCurrentPlayerName("");
         }
       } else {
-        const errData = await res.json().catch(() => ({ detail: "Unknown error" }));
+        const errData: { detail?: string } = await res.json().catch(() => ({ detail: "Unknown error" }));
         setError(errData.detail || "Could not leave seat");
       }
     } catch (err) {
@@ -348,7 +359,6 @@ export default function PokerTable() {
     }
   }
 
-  // Create game
   async function createGame() {
     setLoading(true);
     setError(null);
@@ -379,7 +389,6 @@ export default function PokerTable() {
     }
   }
 
-  // Start new hand manually (for testing)
   async function startHand() {
     if (!gameId) return;
     setLoading(true);
@@ -426,7 +435,6 @@ export default function PokerTable() {
     }
   }
 
-  // Execute action
   async function doAction(action: string) {
     if (!gameId || !gameState) return;
 
@@ -457,7 +465,6 @@ export default function PokerTable() {
     }
   }
 
-  // Render seats for up to 6 players
   const seats = Array.from({ length: 6 }, (_, i) => {
     const player = gameState?.players[i] || null;
     const isCurrentPlayer = i === gameState?.current_player_index;
@@ -485,7 +492,15 @@ export default function PokerTable() {
         ♠️ POKER TABLE ♣️
       </h1>
 
-      {/* Error Display */}
+      {/* Connection Status */}
+      {gameId && (
+        <div className="mb-2">
+          <span className={`text-sm ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
+            {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
+          </span>
+        </div>
+      )}
+
       {error && (
         <motion.div
           initial={{ opacity: 0, y: -20 }}
@@ -497,9 +512,7 @@ export default function PokerTable() {
       )}
 
       {!gameId ? (
-        // Setup screen
         <div className="bg-gray-800 rounded-2xl p-8 shadow-2xl max-w-md mx-auto space-y-6">
-          {/* CREATE GAME */}
           <div>
             <h2 className="text-white text-xl font-bold mb-2">Create New Game</h2>
             <button
@@ -512,7 +525,6 @@ export default function PokerTable() {
             
           <div className="border-t border-gray-700 pt-6" />
             
-          {/* JOIN EXISTING GAME */}
           <div>
             <h2 className="text-white text-xl font-bold mb-2">Join Existing Game</h2>
             <input
@@ -530,11 +542,9 @@ export default function PokerTable() {
               Join Game
             </button>
           </div>
-            
         </div>
       ) : (
         <div className="w-full max-w-7xl">
-          {/* Game Info */}
           <div className="text-center mb-4">
             <p className="text-white text-lg">Game ID: <span className="font-mono bg-gray-800 px-2 py-1 rounded">{gameId}</span></p>
             <p className="text-gray-300 text-sm">
@@ -542,7 +552,6 @@ export default function PokerTable() {
             </p>
           </div>
 
-          {/* Lobby Timer */}
           {isInLobby && (
             <motion.div
               initial={{ scale: 0 }}
@@ -556,14 +565,11 @@ export default function PokerTable() {
             </motion.div>
           )}
 
-          {/* Table */}
           <div className="relative bg-linear-to-br from-green-700 to-green-800 rounded-[50%] shadow-2xl border-8 border-amber-900"
             style={{ width: "900px", height: "600px", margin: "0 auto" }}>
             
-            {/* Inner felt */}
             <div className="absolute inset-8 bg-green-600 rounded-[50%] shadow-inner" />
 
-            {/* Pot in center */}
             {!isInLobby && (
               <motion.div
                 className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-yellow-500 text-black font-bold px-6 py-3 rounded-full shadow-xl"
@@ -574,7 +580,6 @@ export default function PokerTable() {
               </motion.div>
             )}
 
-            {/* Community Cards */}
             {!isInLobby && (
               <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 mt-16 flex gap-2">
                 <AnimatePresence>
@@ -592,11 +597,9 @@ export default function PokerTable() {
               </div>
             )}
 
-            {/* Player Seats */}
             {seats}
           </div>
 
-          {/* Controls */}
           <div className="mt-8 bg-gray-800 rounded-2xl p-6 shadow-2xl">
             <div className="flex justify-between items-center mb-4">
               <div>
@@ -609,7 +612,6 @@ export default function PokerTable() {
                 )}
               </div>
               
-              {/* Manual start button for testing */}
               {isInLobby && activePlayers >= 2 && (
                 <motion.button
                   whileHover={{ scale: 1.05 }}
@@ -633,87 +635,85 @@ export default function PokerTable() {
               </motion.div>
             )}
               
-              {/* Action Buttons (only during game, not in lobby) */}
-              {!isInLobby && gameState?.current_player && !gameState?.game_over && (
-                <div className="bg-gray-700 p-4 rounded-lg">
-                  <p className="text-yellow-300 text-center mb-3 font-bold">
-                    🎯 {gameState.current_player === currentPlayerName ? "Your Turn" : `${gameState.current_player}'s Turn`} 
-                    {gameState.to_call > 0 && ` (Call: $${gameState.to_call})`}
-                  </p>
+            {!isInLobby && gameState?.current_player && !gameState?.game_over && (
+              <div className="bg-gray-700 p-4 rounded-lg">
+                <p className="text-yellow-300 text-center mb-3 font-bold">
+                  🎯 {gameState.current_player === currentPlayerName ? "Your Turn" : `${gameState.current_player}'s Turn`} 
+                  {gameState.to_call > 0 && ` (Call: $${gameState.to_call})`}
+                </p>
 
-                  <div className="flex gap-3 justify-center flex-wrap">
-                    {gameState.legal_actions.includes("check") && (
+                <div className="flex gap-3 justify-center flex-wrap">
+                  {gameState.legal_actions.includes("check") && (
+                    <motion.button
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.9 }}
+                      onClick={() => doAction("check")}
+                      className="bg-gray-600 hover:bg-gray-700 px-6 py-2 rounded-lg text-white font-bold"
+                      disabled={loading || gameState.current_player !== currentPlayerName}
+                    >
+                      Check
+                    </motion.button>
+                  )}
+
+                  {gameState.legal_actions.includes("call") && (
+                    <motion.button
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.9 }}
+                      onClick={() => doAction("call")}
+                      className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg text-white font-bold"
+                      disabled={loading || gameState.current_player !== currentPlayerName}
+                    >
+                      Call ${gameState.to_call}
+                    </motion.button>
+                  )}
+
+                  {gameState.legal_actions.includes("fold") && (
+                    <motion.button
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.9 }}
+                      onClick={() => doAction("fold")}
+                      className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg text-white font-bold"
+                      disabled={loading || gameState.current_player !== currentPlayerName}
+                    >
+                      Fold
+                    </motion.button>
+                  )}
+
+                  {gameState.legal_actions.includes("raise") && (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        className="w-24 p-2 text-black rounded-lg"
+                        value={raiseAmount}
+                        onChange={(e) => setRaiseAmount(Number(e.target.value))}
+                        min={gameState.to_call + 1}
+                        max={gameState.players.find(p => p.name === currentPlayerName)?.chips || 1000}
+                      />
                       <motion.button
                         whileHover={{ scale: 1.05 }}
                         whileTap={{ scale: 0.9 }}
-                        onClick={() => doAction("check")}
-                        className="bg-gray-600 hover:bg-gray-700 px-6 py-2 rounded-lg text-white font-bold"
+                        onClick={() => doAction("raise")}
+                        className="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg text-white font-bold"
                         disabled={loading || gameState.current_player !== currentPlayerName}
                       >
-                        Check
+                        Raise
                       </motion.button>
-                    )}
-
-                    {gameState.legal_actions.includes("call") && (
-                      <motion.button
-                        whileHover={{ scale: 1.05 }}
-                        whileTap={{ scale: 0.9 }}
-                        onClick={() => doAction("call")}
-                        className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg text-white font-bold"
-                        disabled={loading || gameState.current_player !== currentPlayerName}
-                      >
-                        Call ${gameState.to_call}
-                      </motion.button>
-                    )}
-
-                    {gameState.legal_actions.includes("fold") && (
-                      <motion.button
-                        whileHover={{ scale: 1.05 }}
-                        whileTap={{ scale: 0.9 }}
-                        onClick={() => doAction("fold")}
-                        className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg text-white font-bold"
-                        disabled={loading || gameState.current_player !== currentPlayerName}
-                      >
-                        Fold
-                      </motion.button>
-                    )}
-
-                    {gameState.legal_actions.includes("raise") && (
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          className="w-24 p-2 text-black rounded-lg"
-                          value={raiseAmount}
-                          onChange={(e) => setRaiseAmount(Number(e.target.value))}
-                          min={gameState.to_call + 1}
-                          max={gameState.players.find(p => p.name === currentPlayerName)?.chips || 1000}
-                        />
-                        <motion.button
-                          whileHover={{ scale: 1.05 }}
-                          whileTap={{ scale: 0.9 }}
-                          onClick={() => doAction("raise")}
-                          className="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg text-white font-bold"
-                          disabled={loading || gameState.current_player !== currentPlayerName}
-                        >
-                          Raise
-                        </motion.button>
-                      </div>
-                    )}
-                  </div>
+                    </div>
+                  )}
                 </div>
+              </div>
             )}
 
-            {/* Lobby Instructions */}
             {isInLobby && (
               <div className="bg-blue-600 p-4 rounded-lg text-center">
                 <p className="text-white font-bold mb-2">🎪 LOBBY PHASE</p>
                 <p className="text-white text-sm">
-                  Click on empty seats to join. Current players can click &quotLeave Table&quot to leave.
+                  Click on empty seats to join. Current players can click &quot;Leave Table&quot; to leave.
                   Game will automatically start when timer reaches 0 with at least 2 players.
                 </p>
               </div>
             )}
-            {/* Action Log */}
+
             {actionLog.length > 0 && (
               <div className="mt-4 bg-gray-900 p-4 rounded-lg max-h-40 overflow-y-auto">
                 <h3 className="text-white font-bold mb-2">Action Log</h3>

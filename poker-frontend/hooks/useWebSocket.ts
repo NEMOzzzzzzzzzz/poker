@@ -1,90 +1,138 @@
-import { useEffect, useRef, useState } from "react";
-
-// ---- Types ----
+import { useEffect, useRef, useState, useCallback } from "react";
 
 export type WSMessage<T> = {
-  type: "state_update";
-  state: T;
+  type: "state_update" | "upgrade_success" | "upgrade_failed" | "pong";
+  state?: T;
+  error?: string;
 };
 
-// This will be passed from your page.tsx, so the hook stays reusable
 export function useReliableWebSocket<T>(
   url: string,
-  onMessage: (msg: WSMessage<T>) => void
+  onMessage: (msg: WSMessage<T>) => void,
+  options?: {
+    heartbeatInterval?: number;
+    reconnectMinDelay?: number;
+    reconnectMaxDelay?: number;
+  }
 ) {
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectRef = useRef<NodeJS.Timeout | null>(null);
-  const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [attempt, setAttempt] = useState(0);
+  const {
+    heartbeatInterval = 10000,
+    reconnectMinDelay = 500,
+    reconnectMaxDelay = 5000,
+  } = options || {};
 
-  const connect = () => {
-    // Prevent duplicate sockets
-    if (wsRef.current) return;
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
+  const heartbeatTimer = useRef<NodeJS.Timeout | null>(null);
+  const backoffAttempt = useRef(0);
+  const isConnecting = useRef(false);
+
+  const [isConnected, setIsConnected] = useState(false);
+
+  const clearAllTimers = () => {
+    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    if (heartbeatTimer.current) clearInterval(heartbeatTimer.current);
+    reconnectTimer.current = null;
+    heartbeatTimer.current = null;
+  };
+
+  const closeCurrentSocket = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {}
+    }
+    wsRef.current = null;
+    isConnecting.current = false;
+    setIsConnected(false);
+  };
+
+  const scheduleReconnect = useCallback(() => {
+    clearAllTimers();
+    const delay = Math.min(
+      reconnectMaxDelay,
+      reconnectMinDelay * 2 ** backoffAttempt.current
+    );
+    reconnectTimer.current = setTimeout(() => {
+      backoffAttempt.current += 1;
+      connect();
+    }, delay);
+    //eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reconnectMinDelay, reconnectMaxDelay]);
+
+  const connect = useCallback(() => {
+    if (!url || !url.startsWith("ws")) {
+      console.warn("[WS] Skipping connect – Invalid URL:", url);
+      return;
+    }
+
+    if (wsRef.current || isConnecting.current) return;
+
+    isConnecting.current = true;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      console.log("[WS] Connected:", url);
+      isConnecting.current = false;
       setIsConnected(true);
-      setAttempt(0); // Reset retry counter
+      backoffAttempt.current = 0;
 
-      // Heartbeat every 10 seconds
-      heartbeatRef.current = setInterval(() => {
+      clearAllTimers();
+
+      heartbeatTimer.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send("__ping__");
+          ws.send(JSON.stringify({ type: "ping" }));
         }
-      }, 10000);
+      }, heartbeatInterval);
     };
 
     ws.onmessage = (event) => {
-      if (event.data === "__pong__") return;
-
       try {
         const parsed = JSON.parse(event.data) as WSMessage<T>;
-        if (parsed.type === "state_update") {
+        
+        // Handle different message types
+        if (parsed?.type === "state_update" || 
+            parsed?.type === "upgrade_success" || 
+            parsed?.type === "upgrade_failed" ||
+            parsed?.type === "pong") {
           onMessage(parsed);
         }
       } catch (err) {
-        console.error("WS JSON parse error:", err);
+        console.error("[WS] JSON parse error:", err);
       }
     };
 
     ws.onerror = () => {
-      // We intentionally do nothing — reconnect happens on close
+      console.warn("[WS] Socket error");
     };
 
     ws.onclose = () => {
-      setIsConnected(false);
-      wsRef.current = null;
-
-      // Cleanup heartbeat
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-      }
-
-      // Exponential backoff: 500ms → 1s → 2s → 4s → capped at 5s
-      const delay = Math.min(5000, 500 * 2 ** attempt);
-
-      reconnectRef.current = setTimeout(() => {
-        setAttempt((prev) => prev + 1);
-        connect();
-      }, delay);
+      console.log("[WS] Disconnected:", url);
+      closeCurrentSocket();
+      scheduleReconnect();
     };
-  };
+  }, [url, onMessage, heartbeatInterval, scheduleReconnect]);
 
-  // Mount the WebSocket connection
   useEffect(() => {
     connect();
 
     return () => {
-      if (wsRef.current) wsRef.current.close();
-      if (reconnectRef.current) clearTimeout(reconnectRef.current);
-      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      clearAllTimers();
+      closeCurrentSocket();
     };
-    //eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url]);
+  }, [url, connect]);
 
-  return { isConnected };
+  // Expose method to send messages
+  const sendMessage = useCallback((message: Record<string, unknown>) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }, []);
+
+
+  return { isConnected, sendMessage };
 }
