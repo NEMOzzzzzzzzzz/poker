@@ -5,3 +5,5 @@ AI Models used:
 
 TODO:
 1. Spectators action buttons should be grey scaled or not visible.
+2. Winners hand should be visible to all at the end of a hand
+3. New hand button and the end of a hand and option to leave table must be visible
